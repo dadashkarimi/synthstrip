@@ -1,3 +1,6 @@
+import os
+os.environ['TF_XLA_FLAGS'] = '--tf_xla_auto_jit=2 --tf_xla_cpu_global_jit'
+
 import random
 import numpy as np
 import matplotlib.pyplot as plt
@@ -18,7 +21,6 @@ import sys
 import nibabel as nib
 from tensorflow.keras.models import load_model
 import numpy as np
-import os
 import tensorflow as tf
 from neurite_sandbox.tf.models import labels_to_labels
 from neurite_sandbox.tf.utils.augment import add_outside_shapes
@@ -31,6 +33,8 @@ import argparse
 from tensorflow.keras.callbacks import ReduceLROnPlateau
 import pathlib
 import surfa as sf
+import re
+import json
 
 parser = argparse.ArgumentParser(description='Process some integers.')
 parser.add_argument('-lr','--learning_rate',type=float, default=0.0001, help="learning rate")
@@ -53,6 +57,9 @@ parser.add_argument('-d', '--decoder_layers', nargs='+', type=int, help="A list 
 parser.add_argument('-ring', '--ring', action='store_true', default=False, help="A list of dimensions for the decoder")
 parser.add_argument('-shapes', '--shapes', action='store_true', default=False, help="A list of dimensions for the decoder")
 parser.add_argument('-feta', '--feta', action='store_true', default=False, help="feta")
+parser.add_argument('-synth', '--synth', action='store_true', default=False, help="feta")
+# parser.add_argument('-synth', '--synth', action='store_true', default=False, help="feta")
+
 parser.add_argument('-body', '--body', action='store_true', default=False, help="feta")
 parser.add_argument('-brain', '--brain', action='store_true', default=False, help="feta")
 parser.add_argument('-gmm', '--gmm', action='store_true', default=False, help="feta")
@@ -72,13 +79,48 @@ if args.encoder_layers:
 
 # feta = pathlib.Path('/autofs/space/bal_004/users/jd1677/synthstrip/feta_3d')
 # feta_files = list(feta.glob('sub-???/anat/sub-???_rec-mial_dseg.nii.gz'))
-feta = pathlib.Path('feta_scaled_3')
+
+ngpus =len(os.environ["CUDA_VISIBLE_DEVICES"])
+print(f'using {ngpus} gpus')
+if ngpus > 1:
+    model_device = '/gpu:0'
+    synth_device = '/gpu:1'
+    synth_gpu = 1
+    dev_str = ", ".join(map(str, range(ngpus)))
+    print("dev_str:",dev_str)
+else:
+    model_device = '/gpu:0'
+    synth_device = model_device
+    synth_gpu = 0
+    dev_str = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = dev_str
+print(f'model_device {model_device}, synth_device {synth_device}, dev_str {dev_str}')
+print(f'physical GPU # is {os.getenv("SLURM_STEP_GPUS")}')
+
+if args.num_dims==256:
+    print("loading 256 fetus dataset.")
+    feta = pathlib.Path('feta_resized_256')
+    with open("params.json", "r") as json_file:
+        config = json.load(json_file)
+elif args.num_dims==192:
+    print("loading 192 fetus dataset.")
+    feta = pathlib.Path('feta_resized_192')
+    with open("params_192.json", "r") as json_file:
+        config = json.load(json_file)
+
 feta_files = list(feta.glob('*.nii.gz'))
 feta_label_maps = [np.uint8(f.dataobj) for f in map(nib.load, feta_files)]
 
-log_dir = 'logs'
-models_dir = 'models'
 
+if args.synth:
+    log_dir = 'logs_synth'
+    models_dir = 'models_synth'
+else:
+    log_dir = 'logs'
+    models_dir = 'models'
+if args.gmm:
+    log_dir += '_gmm'
+    models_dir += '_gmm'   
 if args.ring:
     log_dir += '_ring'
     models_dir += '_ring'
@@ -92,31 +134,29 @@ if args.feta:
 if args.brain:
     log_dir += '_mgh_brain'
     models_dir += '_mgh_brain'
-    # mgh = pathlib.Path('fetus_brain_label_map')
-    # if args.gmm:
-    #     log_dir += '_gmm'
-    #     models_dir += '_gmm'
-    #     mgh = pathlib.Path('fetus_gmm_brain_label_map')
 
-# log_dir += '_lr_'+str(args.learning_rate)
-# models_dir += '_lr_'+str(args.learning_rate)
+
 
 if args.body:
     log_dir += '_mgh_body'
     models_dir += '_mgh_body'
-    # mgh = pathlib.Path('fetus_label_map')
-    # if args.gmm:
-    #     log_dir += '_gmm'
-    #     models_dir += '_gmm'
-    #     mgh = pathlib.Path('fetus_gmm_label_map')
 
+log_dir += '_'+str(args.num_dims)
+models_dir += '_'+str(args.num_dims)
+
+# en = args.encoder_layers
+# de = args.decoder_layers
+
+# if args.synth:
+#     en = [16, 16, 32 ,32 ,64 ,64 ,64 ,64 ,64 ,64 ,64 ,64 ,64, 256 ,256]
+#     de = [256 ,256 ,64 ,64, 64 ,64 ,64, 64, 64, 64 ,64, 32 ,32 ,16 ,16 ,2]
 mgh_files = []
 mgh_label_maps = []
 if args.brain or args.body:
     mgh = pathlib.Path('fetus_label_map')
     mgh_files = list(mgh.glob('*.nii.gz'))
-    label_maps = [np.uint8(sf.load_volume(str(file_path)).data) for file_path in mgh_files]
-    labels_in = np.unique(label_maps) # change this for feta
+    label_maps = [np.uint8(sf.load_volume(str(file_path)).reshape([dimx,dimy,dimz]).data) for file_path in mgh_files]
+    # labels_in = np.unique(label_maps) # change this for feta
     in_shape = label_maps[0].shape
     print("brain or body!")
 
@@ -125,23 +165,10 @@ else:
     labels = np.unique(label_maps)
     num_labels=9
     in_shape = label_maps[0].shape
-    labels_in = range(max(labels) + num_labels + 1)
-
-# if mgh is not None:
-
-    
+    print("in_shape",in_shape)
+    # labels_in = range(max(labels) + num_labels + 1)
 
 
-    
-# log_dir += f'_params_dim_{dimx}_{nb_features}'
-# models_dir += f'_params_dim_{dimx}_{nb_features}'
-
-# log_dir += '_wm_'+str(args.warp_max)+'_shift_'+str(args.brain_shift)
-# models_dir += '_wm_'+str(args.warp_max)+'_shift_'+str(args.brain_shift)
-
-
-
-# labels = np.unique(label_maps)
 
 num_shapes = 6
 
@@ -153,20 +180,29 @@ if latest_weight:
     shutil.move(latest_weight, os.path.join(models_dir, 'weights_epoch_0.h5'))
 
 
-initial_epoch=args.initial_epoch
-checkpoint_path=models_dir+'/weights_epoch_'+str(initial_epoch)+'.h5'
+# initial_epoch=args.initial_epoch
 
-# if initial_epoch != 0:
-#     log_dir += f'_resume_{initial_epoch}'
+
+
 
 if not os.path.exists(log_dir):
     os.makedirs(log_dir)
 
 if not os.path.exists(models_dir):
     os.makedirs(models_dir)
-    
 
-    
+checkpoint_path=models_dir+'/weights_epoch_0.h5'
+
+if not os.listdir(log_dir):
+    initial_epoch = 0
+    print("initial epoch is 0")
+elif latest_weight:
+    match = re.search(r'(\d+)', latest_weight)
+    initial_epoch = int(match.group())
+else:
+    initial_epoch= args.initial_epoch
+
+
 
 
 batch_size=args.batch_size
@@ -208,31 +244,37 @@ aff_scale=args.scale
 up_scale=False
 
 # labels_in = range(max(labels) + num_labels + 1)
-import json
+
 
 # def create_model(model_config):
 #     return ne.models.labels_to_image_new(**model_config)
 
-with open("params.json", "r") as json_file:
-    config = json.load(json_file)
+
+
 
 # Access the configuration
 model1_config = config["brain"]
 model2_config = config["body"]
 model3_config = config["labels_to_image_model"]
+model4_config = config["labels_to_image_model_with_shapes"]
 
 # Convert labels_out keys to integers for all models
 model1_config["labels_out"] = {int(key): value for key, value in model1_config["labels_out"].items()}
 model2_config["labels_out"] = {int(key): value for key, value in model2_config["labels_out"].items()}
 model3_config["labels_out"] = {int(key): value for key, value in model3_config["labels_out"].items()}
 
+model4_config["labels_out"] = {int(key): value for key, value in model3_config["labels_out"].items()}
 # Now you have the modified configuration
 # Brain
 model1 = create_model(model1_config)
 # Body
 model2 = create_model(model2_config)
+
+
 # Model
 labels_to_image_model = create_model(model3_config)
+
+labels_to_image_model_with_shapes = create_model(model4_config)
 
 # gen_arg = {
 #     'in_shape': in_shape,
@@ -303,7 +345,7 @@ from scipy.ndimage import binary_erosion
 
 reduce_lr = ReduceLROnPlateau(monitor='loss', factor=0.95, patience=10, verbose=1, min_lr=1e-7)
 
-weights_saver = PeriodicWeightsSaver(filepath=models_dir, save_freq=10)  # Save weights every 100 epochs
+weights_saver = PeriodicWeightsSaver(filepath=models_dir, save_freq=20)  # Save weights every 100 epochs
 
 # TB_callback = CustomTensorBoard(
 #     base_log_dir=log_dir,
@@ -337,15 +379,19 @@ TB_callback = CustomTensorBoard(
 
 if __name__ == "__main__":
     en = args.encoder_layers
-    de= args.decoder_layers
+    de = args.decoder_layers
     random.seed(3000)
     
     unet_model = vxm.networks.Unet(inshape=(*in_shape, 1), nb_features=(en, de), 
                                    nb_conv_per_level=nb_conv_per_level,
                                    final_activation_function='softmax')
     input_img = Input(shape=(*in_shape,1))
-    generated_img, y = labels_to_image_model(input_img)
-    # print(generated_img.shape,y.shape)
+
+    if args.shapes:
+        generated_img, y = labels_to_image_model_with_shapes(input_img)
+    else:
+        generated_img, y = labels_to_image_model(input_img)
+
     
     segmentation = unet_model(generated_img)
     combined_model = Model(inputs=input_img, outputs=segmentation)
@@ -358,24 +404,83 @@ if __name__ == "__main__":
     if args.shapes:
         brain_maps = get_brain(label_maps)
         shapes = [draw_shapes(in_shape, num_labels) for _ in range(num_shapes)]
+        print("shapes:",shapes[0].shape)
         shapes = map(np.squeeze, shapes)
         shapes = map(np.uint8, shapes)
-        shapes = [f + max(labels) + 1 for f in shapes]
+        print("brain_maps:",brain_maps[0])#,shapes[0].shape)
+        shapes = [f + 7 + 1 for f in shapes]
         gen = generator(brain_maps, shapes)
     elif args.feta and args.body:
+        unet_model = vxm.networks.Unet(inshape=(*in_shape, 1), nb_features=(en, de), 
+                               nb_conv_per_level=nb_conv_per_level,
+                               final_activation_function='softmax')
+        input_img = Input(shape=(*in_shape,1))
+        input_brain = get_brain_tf(input_img)
+        input_fov = get_fov_tf(input_img)
+        
+        _, y_fov = model2(input_fov)
+        # input_final = input_brain + y_fov * (input_brain == 0)
+        input_final = input_brain + tf.cast(y_fov, dtype=tf.float32) * tf.cast(input_brain == 0, dtype=tf.float32)
+
+        generated_img, y = labels_to_image_model(input_final)
+        segmentation = unet_model(generated_img)
+        combined_model = Model(inputs=input_img, outputs=segmentation)
+        combined_model.add_loss(soft_dice(y, segmentation))
+        combined_model.compile(optimizer=Adam(learning_rate=initial_lr))
+        
         fov_maps = get_fov(label_maps)
-        print("Feta data loaded with size: ",len(feta_label_maps))
-        print("GMM body loaded with size: ",len(fov_maps))
-        gen = gen_brain_feta_fov(feta_label_maps, fov_maps, model1, model2)
+        gen = gen_brain_feta_fov(feta_label_maps, fov_maps)
     elif args.feta and args.brain and args.body:
+        unet_model = vxm.networks.Unet(inshape=(*in_shape, 1), nb_features=(en, de), 
+                       nb_conv_per_level=nb_conv_per_level,
+                       final_activation_function='softmax')
+        input_img = Input(shape=(*in_shape,1))
+        input_brain = get_brain_tf(input_img)
+        _, y_brain = model1(input_brain)
+
+        input_fov = get_fov_tf(input_img)
+        
+        _, y_fov = model2(input_fov)
+        # input_final = y_brain + y_fov * (y_brain == 0)
+        input_final = y_brain + tf.cast(y_fov, dtype=tf.float32) * tf.cast(y_brain == 0, dtype=tf.float32)
+
+        generated_img, y = labels_to_image_model(input_final)
+        segmentation = unet_model(generated_img)
+        combined_model = Model(inputs=input_img, outputs=segmentation)
+        combined_model.add_loss(soft_dice(y, segmentation))
+        combined_model.compile(optimizer=Adam(learning_rate=initial_lr))
+        
+        # fov_maps = get_fov(label_maps)
+        # gen = gen_brain_feta_fov(feta_label_maps, fov_maps)
+
         brain_maps = get_brain(label_maps)
         fov_maps = get_fov(label_maps)
         brain_maps = feta_label_maps + brain_maps
-        gen = gen_brain_feta_fov(brain_maps, fov_maps, model1, model2)
+        gen = gen_brain_feta_fov(brain_maps, fov_maps)
     elif args.brain or args.body:
+        unet_model = vxm.networks.Unet(inshape=(*in_shape, 1), nb_features=(en, de), 
+               nb_conv_per_level=nb_conv_per_level,
+               final_activation_function='softmax')
+        
+        input_img = Input(shape=(*in_shape,1))
+        input_brain = get_brain_tf(input_img)
+        _, y_brain = model1(input_brain)
+
+        input_fov = get_fov_tf(input_img)
+        
+        _, y_fov = model2(input_fov)
+        # input_final = y_brain + y_fov * (y_brain == 0)
+        input_final = y_brain + tf.cast(y_fov, dtype=tf.int32) * tf.cast(y_brain == 0, dtype=tf.int32)
+
+        generated_img, y = labels_to_image_model(input_final)
+        segmentation = unet_model(generated_img)
+        combined_model = Model(inputs=input_img, outputs=segmentation)
+        combined_model.add_loss(soft_dice(y, segmentation))
+        combined_model.compile(optimizer=Adam(learning_rate=initial_lr))
+
         brain_maps = get_brain(label_maps)
         fov_maps = get_fov(label_maps)
-        gen = gen_brain_feta_fov(brain_maps, fov_maps, model1, model2)
+        gen = gen_brain_feta_fov(brain_maps, fov_maps)
     else:
         print("wrong arguments specified!")
     
@@ -387,6 +492,7 @@ if __name__ == "__main__":
 
     ################################
     if os.path.exists(checkpoint_path):
+        print(checkpoint_path)
         combined_model.load_weights(checkpoint_path)
         print("Loaded weights from the checkpoint and continued training.")
 

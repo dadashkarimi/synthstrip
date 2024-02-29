@@ -19,6 +19,16 @@ def get_brain(a):
         a_copy[i][a[i] >7 ] = 0
     return a_copy
 
+def get_brain_tf(a):
+    mask = a > 7
+    a_copy = tf.where(mask, tf.zeros_like(a), a)
+    return a_copy
+
+def get_fov_tf(a, max_shift=90):
+    mask = a < 8
+    a_copy = tf.where(mask, tf.zeros_like(a), a)
+    return a_copy
+    
 def get_fov(a, max_shift=90):
     a_copy = np.copy(a)
     
@@ -264,6 +274,7 @@ def generator(label_maps, shapes):
         out = fg + bg * (fg == 0)
         yield out[None, ..., None]
 
+        
 def generator3D_noshape(label_maps):
     rand = np.random.default_rng()
     label_maps = np.asarray(label_maps)
@@ -358,42 +369,77 @@ def create_model(model_config):
     model_config_ = model_config.copy()
     return ne.models.labels_to_image_new(**model_config_)
 
-def gen_brain_feta_fov(brain_maps, fov_maps, model1, model2):
+        
+# def gen_brain_feta_fov(brain_maps, fov_maps):
 
+#     rand = np.random.default_rng()
+#     brain_maps_ = np.asarray(brain_maps)
+#     fov_maps_ = np.asarray(fov_maps)
+    
+#     while True:
+#         brain_label = rand.choice(brain_maps_)
+#         body_label = rand.choice(fov_maps_)
+#         input_brain = brain_label[None, ..., None]
+#         input_fov = body_label[None, ..., None]
+#         # _ , output_brain = model1(input_brain)
+#         output_brain = input_brain
+#         # _ , output_fov = model2(input_fov)
+#         output_fov = input_fov
+#         output_brain = np.array(output_brain)
+#         output_fov = np.array(output_fov)
+#         output_label = output_brain + output_fov * (output_brain == 0) 
+#         yield output_label[None, ..., None]
+
+        
+def gen_brain_feta_fov(brain_maps, fov_maps):
     rand = np.random.default_rng()
-    brain_maps_ = np.asarray(brain_maps)
-    fov_maps_ = np.asarray(fov_maps)
+    brain_maps = np.asarray(brain_maps)
+    fov_maps = np.asarray(fov_maps)
     
     while True:
-        brain_label = rand.choice(brain_maps_)
-        body_label = rand.choice(fov_maps_)
-        input_brain = brain_label[None, ..., None]
-        input_fov = body_label[None, ..., None]
-        _ , output_brain = model1(input_brain)
-        _ , output_fov = model2(input_fov)
-        output_brain = np.array(output_brain)
-        output_fov = np.array(output_fov)
-        output_label = output_brain + output_fov * (output_brain == 0) 
-        yield output_label[None, ..., None]
-
-
-def gen_brain_feta_fov2(brain_maps, fov_maps, model1, model2):
-
-    gen1 = generator_feta_FOV(brain_maps, fov_maps)
+        fg = rand.choice(brain_maps)
+        bg = rand.choice(fov_maps)
+        out = fg + bg * (fg == 0)
+        yield out[None, ..., None]
+        
+# def gen_brain_feta_fov_gpu(brain_maps, fov_maps, model1, model2):
+#     rand = np.random.default_rng()
+#     brain_maps_ = np.asarray(brain_maps)
+#     fov_maps_ = np.asarray(fov_maps)
     
-    input_brain, input_fov = next(gen1)
+#     while True:
+#         brain_label = tf.convert_to_tensor(rand.choice(brain_maps_), dtype=tf.float32)
+#         body_label = tf.convert_to_tensor(rand.choice(fov_maps_), dtype=tf.float32)
+
+#         input_brain = tf.expand_dims(tf.expand_dims(brain_label, axis=0), axis=-1)
+#         input_fov = tf.expand_dims(tf.expand_dims(body_label, axis=0), axis=-1)
+
+#         _, output_brain = model1(input_brain)
+#         _, output_fov = model2(input_fov)
+
+#         output_brain = np.array(output_brain)
+#         output_fov = np.array(output_fov)
+#         output_label = output_brain + output_fov * (output_brain == 0) 
+
+#         yield output_label[None, ..., None]
+        
+# def gen_brain_feta_fov2(brain_maps, fov_maps, model1, model2):
+
+#     gen1 = generator_feta_FOV(brain_maps, fov_maps)
     
-    _ , output_brain = model1(input_brain)
-    _ , output_fov = model2(input_fov)
-    # print("shapes:",output_brain.shape,output_fov.shape)
+#     input_brain, input_fov = next(gen1)
+    
+#     _ , output_brain = model1(input_brain)
+#     _ , output_fov = model2(input_fov)
+#     # print("shapes:",output_brain.shape,output_fov.shape)
 
 
 
-    output_brain = output_brain.copy()
-    output_fov = output_fov.copy()
+#     output_brain = output_brain.copy()
+#     output_fov = output_fov.copy()
 
-    output_label = output_brain + output_fov * (output_brain == 0) 
-    return output_label[None, ..., None]
+#     output_label = output_brain + output_fov * (output_brain == 0) 
+#     return output_label[None, ..., None]
     
 # def gen_brain_fov_with_flip(brain_maps, fov_maps, model1, model2):
 
