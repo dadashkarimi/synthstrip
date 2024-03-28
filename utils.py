@@ -11,6 +11,92 @@ import os
 import glob
 from scipy.ndimage import binary_erosion
 from scipy.ndimage import binary_dilation
+import keras.backend as K
+from tensorflow.keras.losses import categorical_crossentropy
+from keras import backend as K
+import tensorflow as tf
+import tensorflow_probability as tfp
+
+def deform(s):
+    num_sets = 16
+    ind = tf.random.uniform(shape=(num_sets,), maxval=num_sets, dtype=tf.int32)
+    ind = tf.cast(ind, dtype=tf.uint8)
+    s = tf.cast(s, dtype=tf.int32)  # Convert s to int32
+    return tf.gather(ind, indices=s)
+    
+def draw_shapes_easy(
+    shape,
+    label_min=8,
+    label_max=16,
+    fwhm_min=32,
+    fwhm_max=128,
+    dtype=None,
+    seed=None,
+    **kwargs,
+):
+    # Data types.
+    type_f = tf.float32
+    type_i = tf.int32
+    if dtype is None:
+        dtype = tf.keras.mixed_precision.global_policy().compute_dtype
+    dtype = tf.dtypes.as_dtype(dtype)
+
+    # Images and transforms.
+    out = ne.utils.augment.draw_perlin_full(
+        shape=(*shape, 2),
+        fwhm_min=fwhm_min,
+        fwhm_max=fwhm_max,
+        isotropic=False,
+        batched=False,
+        featured=True,
+        seed=seed,
+        dtype=type_f,
+        reduce=tf.math.reduce_max,
+    )
+    out = ne.utils.minmax_norm(out)
+
+    num_label = tf.random.uniform(shape=(), minval=label_min, maxval=label_max + 1, dtype=type_i)
+    out *= tf.cast(num_label, type_f)
+    out = tf.cast(out, type_i)
+
+    # Random relabeling. For less rare marginal label values.
+    def reassign(x, max_in, max_out):
+        lut = tf.random.uniform(shape=[max_in + 1], maxval=max_out, dtype=type_i)
+        return tf.gather(lut, indices=x)
+
+    # Add labels to break concentricity.
+    a = reassign(out[..., 0:1], max_in=num_label, max_out=num_label)
+    b = reassign(out[..., 1:2], max_in=num_label, max_out=num_label)
+    out = reassign(a + b, max_in=2 * num_label - 2, max_out=num_label)
+    # out = out[None,...]
+    return tf.cast(out, dtype) if out.dtype != dtype else out
+
+
+def dynamic_resize(image, target_width=192):   
+
+    fov = np.multiply(image.shape, image.geom.voxsize)
+
+    new_voxsize = fov / target_width
+
+    new_voxsize = np.max(new_voxsize[:2])  # ignore slice thickness
+    return new_voxsize
+
+def my_dice_coefficient(y_true, y_pred, smooth=1e-8):
+    intersection = np.sum(y_true * y_pred)
+    union = np.sum(y_true) + np.sum(y_pred)
+    return (2.0 * intersection + smooth) / (union + smooth)
+
+def getLargestCC(segmentation):
+    labels = label(segmentation)
+    assert( labels.max() != 0 ) # assume at least 1 CC
+    largestCC = labels == np.argmax(np.bincount(labels.flat)[1:])+1
+    return largestCC
+    
+def minmax_norm(x):
+    x_min = np.min(x)
+    x_max = np.max(x)
+    return (x - x_min) / (x_max - x_min)
+
 
 
 def get_brain(a):
@@ -28,6 +114,11 @@ def get_fov_tf(a, max_shift=90):
     mask = a < 8
     a_copy = tf.where(mask, tf.zeros_like(a), a)
     return a_copy
+
+def process_image(im, unet_model):
+    a = im.copy()
+    return unet_model.predict(a[None,...,None], verbose=0)
+    
     
 def get_fov(a, max_shift=90):
     a_copy = np.copy(a)
@@ -58,9 +149,130 @@ def get_fov(a, max_shift=90):
         a_copy[i] = b
 
     return a_copy
+
+
+
+def percentile_norm_tf(x, percentile=90):
+    # Calculate the specified percentile value
+    p_value = tfp.stats.percentile(x, q=percentile)
+    
+    # Clip the input values to be less than or equal to the percentile value
+    x_clipped = tf.clip_by_value(x, 0, p_value)
+    
+    # Normalize the clipped values to the range [0, 1]
+    x_min_clipped = tf.reduce_min(x_clipped)
+    x_max_clipped = tf.reduce_max(x_clipped)
+    normalized_x = (x_clipped - x_min_clipped) / (x_max_clipped - x_min_clipped+1e-7)
+    
+    return normalized_x
     
 
+def percentile_norm(x, percentile=90):
+    p_value = np.percentile(x, percentile)
+    
+    x_clipped = np.clip(x, 0, p_value)
+    
+    x_min_clipped = np.min(x_clipped)
+    x_max_clipped = np.max(x_clipped)
+    normalized_x = (x_clipped - x_min_clipped) / (x_max_clipped - x_min_clipped)
+    return normalized_x
+    
+def find_manual_mask(filename):
+    base_filename, _ = os.path.splitext(filename)  # Separate filename and extension
+    pattern = re.compile(rf"manual_masks_b\d+_mom_\d+_{re.escape(base_filename)}_segment\.nii\.gz")
 
+    matches = [f for f in os.listdir("mgh_2d") if pattern.match(f)]
+    
+    if matches:
+        return matches[0]
+
+def bounding_box_loss(mask, y_pred):
+    # box_true = create()
+
+    mask = fit_bounding_box(mask)
+
+    total_loss = soft_dice(mask,y_pred )#box_loss + 0.5 * seg_loss  # You can adjust the weight factor as needed
+    return total_loss
+
+def create_bounding_box_indices(min_indices, max_indices):
+    min_indices = tf.clip_by_value(min_indices, 0, 191)
+    max_indices = tf.clip_by_value(max_indices, 0, 191)
+
+    grid_x, grid_y, grid_z = tf.meshgrid(
+        tf.range(min_indices[0], max_indices[0]),
+        tf.range(min_indices[1], max_indices[1]),
+        tf.range(min_indices[2], max_indices[2]),
+        indexing='ij'
+    )
+    indices = tf.stack([grid_x, grid_y, grid_z], axis=-1)
+    return tf.reshape(indices, shape=(-1, 3))
+
+def fit_bounding_box(input_mask,margin=10):
+    # Squeeze the first and last dimensions
+    mask = tf.argmax(input_mask, axis=-1, output_type=tf.int32)
+    mask = tf.squeeze(mask, axis=0)
+    # margin = 10
+    non_zero_indices = tf.where(tf.not_equal(mask, 0))
+    min_indices = tf.maximum(tf.reduce_min(non_zero_indices, axis=0)-margin, tf.constant([0, 0, 0], dtype=tf.int64))
+    max_indices = tf.minimum(tf.reduce_max(non_zero_indices, axis=0) +margin+ 1, tf.constant([191, 191, 191], dtype=tf.int64))
+    bounding_box_dimensions = max_indices - min_indices
+    cube_side_length = tf.reduce_max(bounding_box_dimensions)
+    min_indices = min_indices - tf.math.maximum((cube_side_length - bounding_box_dimensions) // 2, 0)
+    max_indices = min_indices + tf.math.minimum(cube_side_length,64)
+    min_indices = tf.clip_by_value(min_indices, 0, 191)
+    max_indices = tf.clip_by_value(max_indices, 0, 191)
+    new_mask = tf.zeros_like(mask, dtype=tf.int32)
+    indices = create_bounding_box_indices(min_indices, max_indices)
+    updates = tf.ones([tf.shape(indices)[0]], dtype=tf.int32)
+    updates = tf.cast(updates, dtype=tf.int32)
+    new_mask = tf.tensor_scatter_nd_add(new_mask, indices, updates)
+    new_mask = tf.expand_dims(new_mask, axis=0)
+    new_mask = tf.one_hot(new_mask, depth=2)
+    return new_mask
+    
+def fit_bounding_rect_box(input_mask,margin=15):
+    # Squeeze the first and last dimensions
+    print("input mask begining:",input_mask.shape)
+    mask = tf.argmax(input_mask, axis=-1, output_type=tf.int32)
+    mask = tf.squeeze(mask, axis=0)
+    # margin = 5
+    non_zero_indices = tf.where(tf.not_equal(mask, 0))
+    
+    min_indices = tf.maximum(tf.reduce_min(non_zero_indices, axis=0)-margin, tf.constant([0, 0, 0], dtype=tf.int64))
+    max_indices = tf.minimum(tf.reduce_max(non_zero_indices, axis=0) +margin+ 1, tf.constant([191, 191, 191], dtype=tf.int64))
+    
+    print("min/max",min_indices,max_indices)    
+    new_mask = tf.zeros_like(mask, dtype=tf.int32)
+    indices = create_bounding_box_indices(min_indices, max_indices)
+    updates = tf.ones([tf.shape(indices)[0]], dtype=tf.int32)
+    updates = tf.cast(updates, dtype=tf.int32)
+    new_mask = tf.tensor_scatter_nd_add(new_mask, indices, updates)
+    new_mask = tf.expand_dims(new_mask, axis=0)
+    new_mask = tf.one_hot(new_mask, depth=2)
+    return new_mask
+    
+# def fit_bounding_box(input_mask):
+#     # Squeeze the first and last dimensions
+#     print("input mask begining:",input_mask.shape)
+#     mask = tf.argmax(input_mask, axis=-1, output_type=tf.int32)
+#     mask = tf.squeeze(mask, axis=0)
+
+#     non_zero_indices = tf.where(tf.not_equal(mask, 0))
+#     min_indices = tf.reduce_min(non_zero_indices, axis=0)
+#     max_indices = tf.reduce_max(non_zero_indices, axis=0) + 1  # Add 1 to include the last voxel
+        
+#     new_mask = tf.zeros_like(mask, dtype=tf.int32)
+
+#     indices = create_bounding_box_indices(min_indices, max_indices)
+
+#     updates = tf.ones([tf.shape(indices)[0]], dtype=tf.int32)
+
+#     updates = tf.cast(updates, dtype=tf.int32)
+#     new_mask = tf.tensor_scatter_nd_add(new_mask, indices, updates)
+#     new_mask = tf.expand_dims(new_mask, axis=0)
+#     new_mask = tf.one_hot(new_mask, depth=2)
+#     return new_mask
+    
 def add_ring(label_maps):
     for i in range(len(label_maps)):
         label_maps[i] = segment_brain_with_ring(label_maps[i])
@@ -192,7 +404,39 @@ def load_npz_files(folder_path,dimx,dimy,dimz):
             data.append(padded_image)
 
     return data
-    
+
+
+
+def center_of_mass(tensor):
+    # Find the indices of non-zero elements
+    indices = tf.where(tf.not_equal(tensor, 0))
+    # Cast indices to float32
+    indices = tf.cast(indices, tf.float32)
+    # Calculate the center of mass along each axis
+    top  = tf.reduce_sum(indices, axis=0)
+    bot = (tf.cast(tf.shape(indices)[0], tf.float32) + 1e-6)
+    center = tf.divide(top, bot + 1e-6)
+    return center
+
+
+# def center_of_mass_mse(a, b):
+#     # Calculate the center of mass for tensors a and b
+#     center_a = tf.reduce_mean(tf.cast(a, tf.float32), axis=(1, 2, 3))
+#     center_b = tf.reduce_mean(tf.cast(b, tf.float32), axis=(1, 2, 3))
+#     # Calculate the squared Euclidean distance between the centers of mass
+#     distance_squared = tf.reduce_sum(tf.square(center_a - center_b))
+#     # Calculate the mean squared error
+#     mse = tf.reduce_mean(tf.square(center_a - center_b))
+#     return mse
+
+
+def center_of_mass_mse(a, b):
+    center_a = ne.utils.barycenter(a)
+    center_b = ne.utils.barycenter(a)
+    mse = tf.reduce_mean(tf.square(center_a - center_b))
+    return mse
+
+
 def soft_dice(a, b):
     dim = len(a.shape) - 2
     space = list(range(1, dim + 1))
@@ -262,6 +506,15 @@ def synth_generator(label_maps, batch_size=1, same_subj=False, flip=False,**kwar
         gg = x[:batch_size, ...,0]
         y = np.array(void)
         yield gg, y
+
+
+def generator_brain(label_maps):
+    rand = np.random.default_rng()
+    label_maps = np.asarray(label_maps)
+    
+    while True:
+        fg = rand.choice(label_maps)
+        yield fg[None, ..., None]
         
 def generator(label_maps, shapes):
     rand = np.random.default_rng()
@@ -273,7 +526,25 @@ def generator(label_maps, shapes):
         bg = rand.choice(shapes)
         out = fg + bg * (fg == 0)
         yield out[None, ..., None]
-
+        
+def generator_feta_shapes(label_maps, shapes):
+    rand = np.random.default_rng()
+    label_maps = np.asarray(label_maps)
+    shapes = np.asarray(shapes)
+    
+    while True:
+        fg = rand.choice(label_maps)
+        bg = rand.choice(shapes)
+        out = fg + bg * (fg == 0)
+        yield out
+        
+def generator_shapes(shapes):
+    rand = np.random.default_rng()
+    shapes = np.asarray(shapes)
+    
+    while True:
+        bg = rand.choice(shapes)
+        yield bg[None, ..., None]
         
 def generator3D_noshape(label_maps):
     rand = np.random.default_rng()
@@ -367,6 +638,7 @@ def generator3D(label_maps, shapes, zero_background):
 #     return output_label
 def create_model(model_config):
     model_config_ = model_config.copy()
+    # print("")
     return ne.models.labels_to_image_new(**model_config_)
 
         

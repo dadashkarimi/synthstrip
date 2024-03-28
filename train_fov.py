@@ -1,5 +1,5 @@
 import os
-os.environ['TF_XLA_FLAGS'] = '--tf_xla_auto_jit=2 --tf_xla_cpu_global_jit'
+# os.environ['TF_XLA_FLAGS'] = '--tf_xla_auto_jit=2 --tf_xla_cpu_global_jit'
 
 import random
 import numpy as np
@@ -35,6 +35,13 @@ import pathlib
 import surfa as sf
 import re
 import json
+from keras import backend as K
+
+from tensorflow.keras.layers import Input, BatchNormalization
+
+# from tensorflow.keras.layers import Input, InstanceNormalization
+from tensorflow_addons.layers import InstanceNormalization
+
 
 parser = argparse.ArgumentParser(description='Process some integers.')
 parser.add_argument('-lr','--learning_rate',type=float, default=0.0001, help="learning rate")
@@ -58,11 +65,18 @@ parser.add_argument('-ring', '--ring', action='store_true', default=False, help=
 parser.add_argument('-shapes', '--shapes', action='store_true', default=False, help="A list of dimensions for the decoder")
 parser.add_argument('-feta', '--feta', action='store_true', default=False, help="feta")
 parser.add_argument('-synth', '--synth', action='store_true', default=False, help="feta")
+parser.add_argument('-conc', '--conc', action='store_true', default=False, help="concentricity")
+
 # parser.add_argument('-synth', '--synth', action='store_true', default=False, help="feta")
 
 parser.add_argument('-body', '--body', action='store_true', default=False, help="feta")
 parser.add_argument('-brain', '--brain', action='store_true', default=False, help="feta")
 parser.add_argument('-gmm', '--gmm', action='store_true', default=False, help="feta")
+parser.add_argument('-norm', '--norm', action='store_true', default=False, help="feta")
+parser.add_argument('-det', '--detection', action='store_true', default=False, help="detection")
+parser.add_argument('-cm', '--center_of_mass', action='store_true', default=False, help="detection")
+parser.add_argument('-np', '--ninty_percentile', action='store_true', default=False, help="detection")
+parser.add_argument('-bn', '--batch_norm', action='store_true', default=False, help="detection")
 
 args = parser.parse_args()
 # dimx=192
@@ -112,15 +126,43 @@ feta_files = list(feta.glob('*.nii.gz'))
 feta_label_maps = [np.uint8(f.dataobj) for f in map(nib.load, feta_files)]
 
 
-if args.synth:
-    log_dir = 'logs_synth'
-    models_dir = 'models_synth'
-else:
-    log_dir = 'logs'
-    models_dir = 'models'
+# if args.synth:
+log_dir = 'logs/logs_synth'
+models_dir = 'logs/models_synth'
+# else:
+#     log_dir = 'logs'
+#     models_dir = 'models'
+
+if args.conc:
+    log_dir += '_less_conc'
+    models_dir += '_less_conc'
+
+if args.detection:
+    log_dir += '_detection'
+    models_dir += '_detection'
+
+if args.batch_norm:
+    log_dir += '_bn'
+    models_dir += '_bn'
+
+
+if args.center_of_mass:
+    log_dir += '_cm'
+    models_dir += '_cm'
+
+if args.ninty_percentile:
+    log_dir += '_90'
+    models_dir += '_90'
+
+
+if args.norm:
+    log_dir += '_norm'
+    models_dir += '_norm'
+    
 if args.gmm:
     log_dir += '_gmm'
     models_dir += '_gmm'   
+    
 if args.ring:
     log_dir += '_ring'
     models_dir += '_ring'
@@ -170,7 +212,7 @@ else:
 
 
 
-num_shapes = 6
+num_shapes = 8
 
 import os, shutil, glob
 
@@ -255,26 +297,41 @@ up_scale=False
 # Access the configuration
 model1_config = config["brain"]
 model2_config = config["body"]
+model_feta_config = config["feta"]
+
+model_shapes_config = config["shapes"]
+
 model3_config = config["labels_to_image_model"]
-model4_config = config["labels_to_image_model_with_shapes"]
+
+# if args.conc:
+#     model4_config = config["labels_to_image_model_with_shapes_24"]
+# else:
+# model4_config = config["labels_to_image_model_with_shapes"]
 
 # Convert labels_out keys to integers for all models
-model1_config["labels_out"] = {int(key): value for key, value in model1_config["labels_out"].items()}
-model2_config["labels_out"] = {int(key): value for key, value in model2_config["labels_out"].items()}
+# model1_config["labels_out"] = {int(key): value for key, value in model1_config["labels_out"].items()}
+# model2_config["labels_out"] = {int(key): value for key, value in model2_config["labels_out"].items()}
+
+
 model3_config["labels_out"] = {int(key): value for key, value in model3_config["labels_out"].items()}
 
-model4_config["labels_out"] = {int(key): value for key, value in model3_config["labels_out"].items()}
+# model4_config["labels_out"] = {int(key): value for key, value in model4_config["labels_out"].items()}
 # Now you have the modified configuration
 # Brain
-model1 = create_model(model1_config)
+# model1 = create_model(model1_config)
 # Body
-model2 = create_model(model2_config)
+# model2 = create_model(model2_config)
+# FeTA brain
+model_feta = create_model(model_feta_config)
+
+#shapes
+model_shapes = create_model(model_shapes_config)
 
 
 # Model
 labels_to_image_model = create_model(model3_config)
 
-labels_to_image_model_with_shapes = create_model(model4_config)
+# labels_to_image_model_with_shapes = create_model(model4_config)
 
 # gen_arg = {
 #     'in_shape': in_shape,
@@ -381,17 +438,17 @@ if __name__ == "__main__":
     en = args.encoder_layers
     de = args.decoder_layers
     random.seed(3000)
-    
+    epsilon =1e-7
+    min_max_norm = Lambda(lambda x: (x - K.min(x)) / (K.max(x) - K.min(x)+ epsilon) * (1.0) )
+
     unet_model = vxm.networks.Unet(inshape=(*in_shape, 1), nb_features=(en, de), 
-                                   nb_conv_per_level=nb_conv_per_level,
+                                   nb_conv_per_level=nb_conv_per_level, batch_norm=args.batch_norm,
                                    final_activation_function='softmax')
     input_img = Input(shape=(*in_shape,1))
-
-    if args.shapes:
-        generated_img, y = labels_to_image_model_with_shapes(input_img)
-    else:
-        generated_img, y = labels_to_image_model(input_img)
-
+    
+    generated_img, y = labels_to_image_model(input_img)
+    
+    generated_img_norm = min_max_norm(generated_img)
     
     segmentation = unet_model(generated_img)
     combined_model = Model(inputs=input_img, outputs=segmentation)
@@ -399,9 +456,82 @@ if __name__ == "__main__":
     
     combined_model.compile(optimizer=Adam(learning_rate=initial_lr))
 
+    
     if args.ring:
-        brain_maps = add_ring(brain_maps)
-    if args.shapes:
+        brain_maps = add_ring(input_img)
+
+    if args.detection:
+        generated_img, y = labels_to_image_model(input_img)
+
+        segmentation = unet_model(generated_img)
+        combined_model = Model(inputs=input_img, outputs=segmentation)
+        box = fit_bounding_rect_box(y,margin=5)
+        if args.center_of_mass:
+            print("center of mass")
+            combined_model.add_loss(center_of_mass_mse(box, segmentation))
+        else:
+            combined_model.add_loss(soft_dice(box, segmentation))
+        combined_model.compile(optimizer=Adam(learning_rate=initial_lr))
+
+        mgh = pathlib.Path('fetus_label_map')
+        mgh_files = list(mgh.glob('*.nii.gz'))
+        label_maps = [np.uint8(sf.load_volume(str(file_path)).reshape([dimx,dimy,dimz]).data) for file_path in mgh_files]
+    
+        brain_maps = feta_label_maps
+
+        fov_maps = get_fov(label_maps)
+        shapes = [draw_shapes(in_shape, num_labels) for _ in range(num_shapes)]
+        shapes = map(np.squeeze, shapes)
+        shapes = map(np.uint8, shapes)
+        shapes = [f + 7 + 1 for f in shapes]
+        shapes = np.concatenate((shapes, fov_maps), axis=0)
+
+        gen = generator(brain_maps, shapes)
+        
+    elif args.conc:
+        print("concentricity shapes!")
+
+        unet_model = vxm.networks.Unet(inshape=(*in_shape, 1), nb_features=(en, de), batch_norm=args.batch_norm,
+                               nb_conv_per_level=nb_conv_per_level,
+                               final_activation_function='softmax')
+        input_img = Input(shape=(*in_shape,1))
+
+        _, fg = model_feta(input_img)
+        shapes = draw_shapes_easy(shape = (192,)*3)
+
+        shapes = tf.squeeze(shapes)
+        shapes = tf.cast(shapes, tf.uint8)
+
+        # shapes = deform(shapes)
+        _, bg = model_shapes(shapes[None,...,None])
+        bg = bg + 8
+        
+        fg_inner = fg[0, ..., 0]
+        bg_inner = tf.reshape(bg[0, ..., 0], fg_inner.shape)
+        mask = tf.cast(tf.equal(fg_inner, 0), fg_inner.dtype)
+        
+        result = fg_inner + bg_inner * mask
+        
+        generated_img , y = labels_to_image_model(result[None,...,None])
+        
+        if args.ninty_percentile:
+            generated_img_norm = percentile_norm_tf(generated_img)
+        elif args.norm:
+            generated_img_norm = min_max_norm(generated_img)
+        else:
+            generated_img_norm = generated_img
+                
+        segmentation = unet_model(generated_img_norm)
+        combined_model = Model(inputs=input_img, outputs=segmentation)
+        combined_model.add_loss(soft_dice(y, segmentation))
+        combined_model.compile(optimizer=Adam(learning_rate=initial_lr))
+        
+        brain_maps = feta_label_maps
+        brain_maps = [tf.cast(brain, tf.uint8) for brain in brain_maps]
+
+        gen = generator_brain(brain_maps)
+
+    elif args.shapes:
         brain_maps = get_brain(label_maps)
         shapes = [draw_shapes(in_shape, num_labels) for _ in range(num_shapes)]
         print("shapes:",shapes[0].shape)
@@ -412,22 +542,24 @@ if __name__ == "__main__":
         gen = generator(brain_maps, shapes)
     elif args.feta and args.body:
         unet_model = vxm.networks.Unet(inshape=(*in_shape, 1), nb_features=(en, de), 
-                               nb_conv_per_level=nb_conv_per_level,
-                               final_activation_function='softmax')
+                       nb_conv_per_level=nb_conv_per_level,
+                       final_activation_function='softmax')
         input_img = Input(shape=(*in_shape,1))
         input_brain = get_brain_tf(input_img)
+        _, y_brain = model_feta(input_brain)
+
         input_fov = get_fov_tf(input_img)
         
         _, y_fov = model2(input_fov)
-        # input_final = input_brain + y_fov * (input_brain == 0)
-        input_final = input_brain + tf.cast(y_fov, dtype=tf.float32) * tf.cast(input_brain == 0, dtype=tf.float32)
+        # input_final = y_brain + y_fov * (y_brain == 0)
+        input_final = y_brain + tf.cast(y_fov, dtype=tf.int32) * tf.cast(y_brain == 0, dtype=tf.int32)
 
         generated_img, y = labels_to_image_model(input_final)
         segmentation = unet_model(generated_img)
         combined_model = Model(inputs=input_img, outputs=segmentation)
         combined_model.add_loss(soft_dice(y, segmentation))
         combined_model.compile(optimizer=Adam(learning_rate=initial_lr))
-        
+
         fov_maps = get_fov(label_maps)
         gen = gen_brain_feta_fov(feta_label_maps, fov_maps)
     elif args.feta and args.brain and args.body:
@@ -444,14 +576,11 @@ if __name__ == "__main__":
         # input_final = y_brain + y_fov * (y_brain == 0)
         input_final = y_brain + tf.cast(y_fov, dtype=tf.float32) * tf.cast(y_brain == 0, dtype=tf.float32)
 
-        generated_img, y = labels_to_image_model(input_final)
+        generated_img, y = labels_to_image_model_with_shapes(input_final)
         segmentation = unet_model(generated_img)
         combined_model = Model(inputs=input_img, outputs=segmentation)
         combined_model.add_loss(soft_dice(y, segmentation))
         combined_model.compile(optimizer=Adam(learning_rate=initial_lr))
-        
-        # fov_maps = get_fov(label_maps)
-        # gen = gen_brain_feta_fov(feta_label_maps, fov_maps)
 
         brain_maps = get_brain(label_maps)
         fov_maps = get_fov(label_maps)
