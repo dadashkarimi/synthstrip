@@ -128,7 +128,7 @@ feta_label_maps = [np.uint8(f.dataobj) for f in map(nib.load, feta_files)]
 
 # if args.synth:
 log_dir = 'logs/logs_synth'
-models_dir = 'logs/models_synth'
+models_dir = 'models_synth'
 # else:
 #     log_dir = 'logs'
 #     models_dir = 'models'
@@ -419,7 +419,7 @@ weights_saver = PeriodicWeightsSaver(filepath=models_dir, save_freq=20)  # Save 
 
 TB_callback = CustomTensorBoard(
     base_log_dir=log_dir,
-    histogram_freq=100,
+    histogram_freq=1000,
     write_graph=True,
     write_images=False,
     write_steps_per_second=False,

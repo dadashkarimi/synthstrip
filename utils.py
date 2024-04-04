@@ -186,6 +186,28 @@ def find_manual_mask(filename):
     if matches:
         return matches[0]
 
+def all_non_zero_inside(y_true, y_pred):
+    """
+    Checks if all non-zero voxels in y_true are also non-zero in y_pred.
+    
+    Args:
+        y_true (numpy.ndarray): Ground truth data (true labels).
+        y_pred (numpy.ndarray): Predicted data (model output).
+        
+    Returns:
+        bool: True if all non-zero voxels in y_true are also non-zero in y_pred, else False.
+    """
+    # Ensure both y_true and y_pred have the same shape
+    assert y_true.shape == y_pred.shape, "Shapes of y_true and y_pred must match"
+    
+    # Check if all non-zero voxels in y_true are also non-zero in y_pred
+    non_zero_indices = y_true.nonzero()
+    for idx in zip(*non_zero_indices):
+        if y_pred[idx] == 0:
+            return 0
+    
+    return 1
+
 def bounding_box_loss(mask, y_pred):
     # box_true = create()
 
@@ -343,9 +365,9 @@ class CustomTensorBoard(tf.keras.callbacks.TensorBoard):
          self.base_log_dir = base_log_dir
 
     def on_epoch_begin(self, epoch, logs=None):
-        if epoch % 100 == 0:  # Check if it's the start of a new set of 50 epochs
-            self.log_dir = f"{self.base_log_dir}/epoch_{epoch}"
-            super().set_model(self.model)
+        # if epoch % self.histogram_freq == 0:  # Check if it's the start of a new set of 50 epochs
+        self.log_dir = self.base_log_dir
+        super().set_model(self.model)
 
 
 class PeriodicWeightsSaver(tf.keras.callbacks.Callback):
